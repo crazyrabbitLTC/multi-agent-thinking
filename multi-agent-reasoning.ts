@@ -370,12 +370,41 @@ class Solver {
   async propose(subtask: Subtask, context: Record<string, any>, k = 3, goal: string = '') {
     logProgress(`Generating ${k} proposals for ${subtask.kind} task: ${subtask.id}`, 2);
     
-    // Pre-fetch retrieval results once (this may include web search)
-    const retrievalStartTime = Date.now();
-    const retrieval = await this.retriever.retrieve(subtask.prompt, subtask.kind, goal);
-    const retrievalTime = Date.now() - retrievalStartTime;
-    if (retrievalTime > 1000) {
-      logSuccess(`Retrieval completed in ${formatTime(retrievalTime)}`, 3);
+    // Get sources: use research sources from context, or do new retrieval for research tasks
+    let retrieval: any;
+    let retrievalTime = 0;
+    
+    if (subtask.kind === 'research') {
+      // Research task: do actual retrieval (may include web search)
+      const retrievalStartTime = Date.now();
+      retrieval = await this.retriever.retrieve(subtask.prompt, subtask.kind, goal);
+      retrievalTime = Date.now() - retrievalStartTime;
+      if (retrievalTime > 1000) {
+        logSuccess(`Retrieval completed in ${formatTime(retrievalTime)}`, 3);
+      }
+    } else {
+      // Reasoning/verification tasks: use sources from research step in context
+      const researchResults = Object.values(context).find(
+        (result: any) => result?.evidence?.sources || result?.citations
+      );
+      
+      if (researchResults) {
+        const sourcesToUse = researchResults.citations || researchResults.sources || ['context-sources'];
+        logProgress(`Using research sources from context: ${sourcesToUse.slice(0, 2).join(', ')}${sourcesToUse.length > 2 ? '...' : ''}`, 3);
+        retrieval = researchResults.evidence || {
+          nodes: [{ id: 'research_context', type: 'research', text: 'Using sources from research step' }],
+          edges: [],
+          sources: sourcesToUse,
+        };
+      } else {
+        // Fallback if no research context available
+        logProgress('No research context found, using knowledge-based sources', 3);
+        retrieval = {
+          nodes: [{ id: 'knowledge', type: 'knowledge', text: `Knowledge-based response for: ${subtask.prompt}` }],
+          edges: [],
+          sources: ['internal-knowledge'],
+        };
+      }
     }
     
     // Generate all proposals in parallel (no artificial delays)
@@ -387,10 +416,20 @@ class Solver {
       try {
         const system = `You are the ${subtask.kind} specialist. Use the evidence graph and be concise but precise. Cite sources explicitly.`;
         
+        // Create enhanced prompt with explicit source tracking
+        const promptData = {
+          subtask,
+          context,
+          evidence_graph: retrieval,
+          instruction: subtask.kind === 'verify' ? 
+            'CRITICAL: Verify the previous step against the ORIGINAL research sources. Do not use internal knowledge if real sources were found.' :
+            'Use the provided evidence and sources to complete this task.'
+        };
+        
         const generateOptions: any = {
           model: MODELS.solver,
           system,
-          prompt: JSON.stringify({ subtask, context, evidence_graph: retrieval }),
+          prompt: JSON.stringify(promptData),
           temperature: 0.6 + (i * 0.1), // Slight temperature variation for diversity
         };
         
@@ -503,25 +542,50 @@ class Judge {
     const tests = await this.tooling.runTests(artifact);
     const needsCitations = this.requiresCitations(goal);
     
+    // Analyze the sources being used FIRST
+    const citations = artifact.citations || artifact.sources || [];
+    const hasRealSources = citations.some((source: string) => 
+      source.startsWith('http') && !source.includes('example.com')
+    );
+    
     let system = 'You are a strict verifier. ';
-    if (needsCitations) {
+    if (hasRealSources) {
+      system += 'CRITICAL: Real sources were found during research. Verify all claims against these specific sources. Do not use internal knowledge when real sources are available.';
+    } else if (needsCitations) {
       system += 'Check factuality against citations and logical consistency. Penalize unsupported factual claims.';
     } else {
       system += 'Focus on logical consistency and mathematical/technical accuracy. Citations are not required for math, calculations, or code - the logic itself is the evidence.';
     }
+    const usesKnowledgeBase = citations.includes('internal-knowledge');
     
-    // Check if this uses knowledge-based sources
-    const usesKnowledgeBase = artifact.citations?.includes('internal-knowledge') || 
-                              artifact.sources?.includes('internal-knowledge');
+    // Determine evaluation mode based on actual sources found
+    let evaluationMode: string;
+    let judgeNote: string;
+    
+    if (hasRealSources) {
+      evaluationMode = 'source_verification';
+      judgeNote = 'CRITICAL: Verify against the specific sources cited. Check if claims match the actual source content from the research phase.';
+      logProgress(`Judge using real sources: ${citations.filter((s: string) => s.startsWith('http')).slice(0, 2).join(', ')}`, 3);
+    } else if (usesKnowledgeBase || !needsCitations) {
+      evaluationMode = 'logic_based';
+      judgeNote = 'Evaluate logical accuracy and completeness. External citations not required.';
+    } else {
+      evaluationMode = 'citation_required';
+      judgeNote = 'This requires factual verification with external sources.';
+      logProgress('Judge mode: citation_required (no real sources found)', 3);
+    }
     
     const judgePrompt = {
       subtask,
       artifact, 
       tests,
-      evaluation_mode: needsCitations && !usesKnowledgeBase ? 'citation_required' : 'logic_based',
-      note: needsCitations && !usesKnowledgeBase ? 
-        'This question requires factual citations from external sources.' : 
-        'This is a knowledge-based question - evaluate the logical accuracy and completeness, not external citations.'
+      evaluation_mode: evaluationMode,
+      sources_available: citations,
+      has_real_sources: hasRealSources,
+      note: judgeNote,
+      critical_instruction: subtask.kind === 'verify' ? 
+        'You are verifying the previous reasoning step. Use the SAME sources that were used in the research phase. Do not abandon real sources for internal knowledge.' :
+        'Evaluate this step for accuracy and completeness.'
     };
     
     const generateOptions: any = {
