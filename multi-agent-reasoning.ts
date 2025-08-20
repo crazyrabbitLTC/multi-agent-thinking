@@ -276,10 +276,18 @@ class Retriever {
     }
     
     // For non-research tasks or when search is disabled/fails
+    const evidenceText = shouldSearch ? 
+      `Evidence for: ${query}` : 
+      `Knowledge-based response for: ${query} (no external sources needed)`;
+    
+    const sources = shouldSearch ? 
+      ['https://example.com/source'] : 
+      ['internal-knowledge']; // Indicate this is knowledge-based
+    
     return {
-      nodes: [{ id: 'claim1', type: 'claim', text: `Evidence for: ${query}` }],
+      nodes: [{ id: 'knowledge', type: shouldSearch ? 'claim' : 'knowledge', text: evidenceText }],
       edges: [],
-      sources: ['https://example.com/source'],
+      sources: sources,
     } as const;
   }
 }
@@ -361,42 +369,66 @@ class Solver {
 
   async propose(subtask: Subtask, context: Record<string, any>, k = 3, goal: string = '') {
     logProgress(`Generating ${k} proposals for ${subtask.kind} task: ${subtask.id}`, 2);
-    const retrieval = await this.retriever.retrieve(subtask.prompt, subtask.kind, goal);
     
-    // Generate proposals in parallel with rate limiting delay
+    // Pre-fetch retrieval results once (this may include web search)
+    const retrievalStartTime = Date.now();
+    const retrieval = await this.retriever.retrieve(subtask.prompt, subtask.kind, goal);
+    const retrievalTime = Date.now() - retrievalStartTime;
+    if (retrievalTime > 1000) {
+      logSuccess(`Retrieval completed in ${formatTime(retrievalTime)}`, 3);
+    }
+    
+    // Generate all proposals in parallel (no artificial delays)
+    logProgress(`Starting ${k} parallel proposal generations`, 3);
+    const proposalStartTime = Date.now();
+    
     const proposalPromises = Array.from({ length: k }, async (_, i) => {
-      // Add delay between requests to avoid rate limits
-      if (i > 0 && MODELS.provider === 'Groq') {
-        await new Promise(resolve => setTimeout(resolve, 2000)); // 2 second delay
-      }
-      
-      logProgress(`Proposal ${i + 1}/${k}`, 3);
-      const system = `You are the ${subtask.kind} specialist. Use the evidence graph and be concise but precise. Cite sources explicitly.`;
-      
-      const generateOptions: any = {
-        model: MODELS.solver,
-        system,
-        prompt: JSON.stringify({ subtask, context, evidence_graph: retrieval }),
-        temperature: 0.6 + (i * 0.1), // Slight temperature variation for diversity
-      };
-      
-      // Add reasoning effort for Groq GPT-OSS models
-      if (MODELS.provider === 'Groq') {
-        generateOptions.providerOptions = {
-          groq: {
-            reasoningEffort: subtask.kind === 'verify' || subtask.kind === 'reason' ? 'high' : 'medium',
-          },
-        };
-      }
-      
+      const proposalId = i + 1;
       try {
+        const system = `You are the ${subtask.kind} specialist. Use the evidence graph and be concise but precise. Cite sources explicitly.`;
+        
+        const generateOptions: any = {
+          model: MODELS.solver,
+          system,
+          prompt: JSON.stringify({ subtask, context, evidence_graph: retrieval }),
+          temperature: 0.6 + (i * 0.1), // Slight temperature variation for diversity
+        };
+        
+        // Add reasoning effort for Groq GPT-OSS models
+        if (MODELS.provider === 'Groq') {
+          generateOptions.providerOptions = {
+            groq: {
+              reasoningEffort: subtask.kind === 'verify' || subtask.kind === 'reason' ? 'high' : 'medium',
+            },
+          };
+        }
+        
         const { text } = await generateText(generateOptions);
+        logSuccess(`Proposal ${proposalId} completed`, 4);
         return { text, citations: retrieval.sources, evidence: retrieval };
+        
       } catch (error) {
-        logError(`Proposal ${i + 1} failed: ${error instanceof Error ? error.message : 'Unknown error'}`, 3);
-        // Return a fallback proposal
+        const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+        logError(`Proposal ${proposalId} failed: ${errorMsg}`, 4);
+        
+        // For rate limits, implement exponential backoff
+        if (errorMsg.includes('rate limit') || errorMsg.includes('Rate limit')) {
+          const backoffTime = Math.min(1000 * Math.pow(2, i), 10000); // Max 10s backoff
+          logProgress(`Retrying proposal ${proposalId} after ${formatTime(backoffTime)}`, 4);
+          await new Promise(resolve => setTimeout(resolve, backoffTime));
+          
+          try {
+            const { text } = await generateText(generateOptions);
+            logSuccess(`Proposal ${proposalId} completed (retry)`, 4);
+            return { text, citations: retrieval.sources, evidence: retrieval };
+          } catch (retryError) {
+            logError(`Proposal ${proposalId} retry failed`, 4);
+          }
+        }
+        
+        // Return fallback proposal
         return {
-          text: `Fallback proposal ${i + 1}: Unable to generate due to rate limits or other issues.`,
+          text: `Fallback proposal ${proposalId}: ${errorMsg.includes('rate limit') ? 'Rate limited - using fallback response.' : 'Error occurred during generation.'}`,
           citations: retrieval.sources,
           evidence: retrieval,
         };
@@ -404,14 +436,28 @@ class Solver {
     });
     
     const proposals = await Promise.all(proposalPromises);
-    logSuccess(`Generated ${proposals.length} proposals for ${subtask.id}`, 2);
+    const proposalTime = Date.now() - proposalStartTime;
+    logSuccess(`Generated ${proposals.length} proposals in ${formatTime(proposalTime)}`, 2);
     return proposals;
   }
 
   vote(proposals: Array<{ text: string; citations: string[]; evidence: any }>) {
-    // Minimal heuristic: prefer the longest common substring style (proxy for consensus)
-    // For the sketch, return the first; replace with a judge‑assisted ranker.
-    return proposals[0];
+    // Quick voting: prefer the longest response (often most detailed)
+    // Or return the first if they're similar length
+    if (proposals.length === 1) return proposals[0];
+    
+    const sortedByLength = [...proposals].sort((a, b) => b.text.length - a.text.length);
+    
+    // If the longest is significantly longer (>20% more), prefer it
+    // Otherwise stick with the first (faster)
+    const longest = sortedByLength[0];
+    const first = proposals[0];
+    
+    if (longest.text.length > first.text.length * 1.2) {
+      return longest;
+    }
+    
+    return first;
   }
 }
 
@@ -464,14 +510,18 @@ class Judge {
       system += 'Focus on logical consistency and mathematical/technical accuracy. Citations are not required for math, calculations, or code - the logic itself is the evidence.';
     }
     
+    // Check if this uses knowledge-based sources
+    const usesKnowledgeBase = artifact.citations?.includes('internal-knowledge') || 
+                              artifact.sources?.includes('internal-knowledge');
+    
     const judgePrompt = {
       subtask,
       artifact, 
       tests,
-      evaluation_mode: needsCitations ? 'citation_required' : 'logic_based',
-      note: needsCitations ? 
-        'This question requires factual citations and sources.' : 
-        'This is a math/code question - evaluate the logic, not citations.'
+      evaluation_mode: needsCitations && !usesKnowledgeBase ? 'citation_required' : 'logic_based',
+      note: needsCitations && !usesKnowledgeBase ? 
+        'This question requires factual citations from external sources.' : 
+        'This is a knowledge-based question - evaluate the logical accuracy and completeness, not external citations.'
     };
     
     const generateOptions: any = {
@@ -532,21 +582,43 @@ class Orchestrator {
       const batch = ready();
       if (batch.length === 0) throw new Error('Deadlock in plan dependencies');
 
-      // Process batch in parallel when possible
-      const batchPromises = batch.map(async (sub) => {
-        taskCount++;
-        console.log(`\n[${taskCount}/${plan.subtasks.length}] Processing subtask: ${sub.id} (${sub.kind})`);
+      // Process batch in parallel when possible, with better progress tracking
+      const batchStartTime = Date.now();
+      
+      if (batch.length > 1) {
+        logProgress(`Processing ${batch.length} subtasks in parallel`, 1);
+      }
+      
+      const batchPromises = batch.map(async (sub, index) => {
+        const currentTaskNum = taskCount + index + 1;
+        console.log(`\n[${currentTaskNum}/${plan.subtasks.length}] Processing subtask: ${sub.id} (${sub.kind})`);
+        
+        const taskStartTime = Date.now();
         const artifact = await this.executeSubtask(sub, artifacts, goal);
-        return { id: sub.id, artifact };
+        const taskDuration = Date.now() - taskStartTime;
+        
+        return { 
+          id: sub.id, 
+          artifact, 
+          duration: taskDuration,
+          taskNumber: currentTaskNum 
+        };
       });
       
       const results = await Promise.all(batchPromises);
+      const batchDuration = Date.now() - batchStartTime;
+      
+      taskCount += batch.length;
       
       // Update artifacts and mark as done
-      for (const { id, artifact } of results) {
+      for (const { id, artifact, duration, taskNumber } of results) {
         artifacts[id] = artifact;
         done.add(id);
-        logSuccess(`Completed subtask ${id}`, 1);
+        logSuccess(`Completed subtask ${id} in ${formatTime(duration)}`, 1);
+      }
+      
+      if (batch.length > 1) {
+        logSuccess(`Batch of ${batch.length} tasks completed in ${formatTime(batchDuration)}`, 1);
       }
     }
 
