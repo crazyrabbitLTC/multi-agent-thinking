@@ -32,8 +32,9 @@ build/
 ehthumbs.db
 Thumbs.db
 
-# Evidence logs
+# Evidence and reasoning logs
 evidence-*.json
+reasoning-*.json
 
 # Temporary files
 *.tmp

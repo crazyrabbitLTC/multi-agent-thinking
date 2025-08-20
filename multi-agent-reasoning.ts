@@ -20,6 +20,7 @@ import { z } from 'zod';
 import { generateText } from 'ai';
 import { createOpenAI } from '@ai-sdk/openai';
 import { createGroq } from '@ai-sdk/groq';
+import 'dotenv/config';
 
 // ────────────────────────────────────────────────────────────────────────────────
 // Utility functions for timing and progress feedback
@@ -44,6 +45,8 @@ function logError(message: string, indent = 0) {
   const prefix = '  '.repeat(indent);
   console.log(`${prefix}❌ ${message}`);
 }
+
+type ModelProvider = 'openai' | 'groq';
 
 // Environment validation
 function validateEnvironment(provider: ModelProvider): boolean {
@@ -86,8 +89,6 @@ function validateEnvironment(provider: ModelProvider): boolean {
 // Configure models (OpenAI and Groq providers)
 // ────────────────────────────────────────────────────────────────────────────────
 
-type ModelProvider = 'openai' | 'groq';
-
 function createModels(provider: ModelProvider) {
   switch (provider) {
     case 'openai': {
@@ -97,15 +98,17 @@ function createModels(provider: ModelProvider) {
         solver: openai('gpt-4o-mini'),
         judge: openai('gpt-4o'),
         provider: 'OpenAI' as const,
+        models: 'GPT-4o-mini (planner/solver), GPT-4o (judge)' as const,
       };
     }
     case 'groq': {
       const groq = createGroq({ apiKey: process.env.GROQ_API_KEY! });
       return {
-        planner: groq('llama-3.3-70b-versatile'),
-        solver: groq('llama-3.3-70b-versatile'),
-        judge: groq('llama-3.3-70b-versatile'),
+        planner: groq('openai/gpt-oss-20b'),          // Fast reasoning model
+        solver: groq('openai/gpt-oss-20b'),           // Same for consistency
+        judge: groq('openai/gpt-oss-120b'),           // Most powerful for validation
         provider: 'Groq' as const,
+        models: 'GPT-OSS-20B (planner/solver), GPT-OSS-120B (judge)' as const,
       };
     }
     default:
@@ -195,12 +198,24 @@ class Planner {
   async makePlan(userGoal: string): Promise<Plan> {
     logProgress('Creating execution plan...', 1);
     const system = `You are a planning assistant. Decompose the goal into 3-6 atomic subtasks forming a DAG. Return strict JSON.`;
-    const { text } = await generateText({
+    
+    const generateOptions: any = {
       model: MODELS.planner,
       system,
-      prompt: `Goal: ${userGoal}\nReturn JSON with { subtasks: [{id, kind, prompt, deps?}] }` ,
+      prompt: `Goal: ${userGoal}\nReturn JSON with { subtasks: [{id, kind, prompt, deps?}] }`,
       temperature: 0.2,
-    });
+    };
+    
+    // Add reasoning effort for Groq GPT-OSS models
+    if (MODELS.provider === 'Groq') {
+      generateOptions.providerOptions = {
+        groq: {
+          reasoningEffort: 'medium',
+        },
+      };
+    }
+    
+    const { text } = await generateText(generateOptions);
 
     // Guarded parse; on failure, fall back to a default 3-step plan
     try {
@@ -238,12 +253,24 @@ class Solver {
     for (let i = 0; i < k; i++) {
       logProgress(`Proposal ${i + 1}/${k}`, 3);
       const system = `You are the ${subtask.kind} specialist. Use the evidence graph and be concise but precise. Cite sources explicitly.`;
-      const { text } = await generateText({
+      
+      const generateOptions: any = {
         model: MODELS.solver,
         system,
         prompt: JSON.stringify({ subtask, context, evidence_graph: retrieval }),
         temperature: 0.6,
-      });
+      };
+      
+      // Add reasoning effort for Groq GPT-OSS models
+      if (MODELS.provider === 'Groq') {
+        generateOptions.providerOptions = {
+          groq: {
+            reasoningEffort: subtask.kind === 'verify' || subtask.kind === 'reason' ? 'high' : 'medium',
+          },
+        };
+      }
+      
+      const { text } = await generateText(generateOptions);
       proposals.push({ text, citations: retrieval.sources, evidence: retrieval });
     }
 
@@ -269,12 +296,24 @@ class Judge {
     logProgress(`Judging artifact for ${subtask.id}`, 2);
     const tests = await this.tooling.runTests(artifact);
     const system = 'You are a strict verifier. Check factuality vs citations and logical consistency.';
-    const { text: critique } = await generateText({
+    
+    const generateOptions: any = {
       model: MODELS.judge,
       system,
       prompt: JSON.stringify({ subtask, artifact, tests }),
       temperature: 0,
-    });
+    };
+    
+    // Add reasoning effort for Groq GPT-OSS models (highest for judge)
+    if (MODELS.provider === 'Groq') {
+      generateOptions.providerOptions = {
+        groq: {
+          reasoningEffort: 'high',
+        },
+      };
+    }
+    
+    const { text: critique } = await generateText(generateOptions);
 
     const passed = tests.every(t => t.passed);
     if (passed) {
@@ -385,11 +424,14 @@ function printUsage() {
   console.log('  npx tsx multi-agent-reasoning.ts --model openai "Optimize React performance"\n');
   console.log('Environment Variables:');
   console.log('  OPENAI_API_KEY - Required for OpenAI provider');
-  console.log('  GROQ_API_KEY   - Required for Groq provider');
-  console.log('  SAVE_EVIDENCE=1 - Optional: Save detailed evidence log to file\n');
-  console.log('Supported Models:');
-  console.log('  OpenAI: GPT-4o, GPT-4o-mini');
-  console.log('  Groq:   Llama 3.3 70B, Gemma 2 9B, Qwen QwQ 32B\n');
+  console.log('  GROQ_API_KEY   - Required for Groq provider\n');
+  console.log('Output:');
+  console.log('  Clean answer displayed on CLI');
+  console.log('  Detailed reasoning automatically saved to reasoning-TIMESTAMP.json\n');
+  console.log('Models:');
+  console.log('  OpenAI: GPT-4o-mini (planner/solver), GPT-4o (judge)');
+  console.log('  Groq:   GPT-OSS-20B (planner/solver), GPT-OSS-120B (judge)\n');
+  console.log('Note: Groq\'s GPT-OSS models support reasoning and browser search tools');
 }
 
 export async function runMultiAgentReasoning(goal: string, provider: ModelProvider = 'openai') {
@@ -399,7 +441,7 @@ export async function runMultiAgentReasoning(goal: string, provider: ModelProvid
   
   // Initialize models with selected provider
   MODELS = createModels(provider);
-  console.log(`\n🤖 Using ${MODELS.provider} models`);
+  console.log(`\n🤖 Using ${MODELS.provider}: ${MODELS.models}`);
 
   const retriever = new Retriever();
   const tooling = new Tooling();
@@ -411,31 +453,46 @@ export async function runMultiAgentReasoning(goal: string, provider: ModelProvid
   console.log(`\n🎯 GOAL: ${goal}`);
   const result = await orch.run(goal);
   
+  // Display clean answer on CLI
   console.log('\n' + '='.repeat(80));
-  console.log('🏆 FINAL RESULT');
+  console.log('🏆 ANSWER');
   console.log('='.repeat(80));
-  console.log(JSON.stringify(result.final, null, 2));
   
-  console.log('\n' + '='.repeat(80));
-  console.log('📋 EXECUTION PLAN');
-  console.log('='.repeat(80));
-  result.plan.subtasks.forEach((task, i) => {
-    console.log(`${i + 1}. [${task.kind.toUpperCase()}] ${task.prompt}`);
-    if (task.deps) {
-      console.log(`   Dependencies: ${task.deps.join(', ')}`);
+  // Extract the main text content from the final result
+  let answer = '';
+  if (typeof result.final === 'object' && result.final !== null) {
+    if ('text' in result.final && typeof result.final.text === 'string') {
+      answer = result.final.text;
+    } else {
+      answer = JSON.stringify(result.final, null, 2);
     }
-  });
+  } else {
+    answer = String(result.final);
+  }
+  
+  console.log(answer);
+  console.log('\n' + '='.repeat(80));
   
   console.log(`\n⏱️  Total execution time: ${formatTime(result.executionTime)}`);
   
-  // Optionally save detailed evidence log
-  if (process.env.SAVE_EVIDENCE) {
-    const fs = await import('fs');
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const filename = `evidence-${timestamp}.json`;
-    fs.writeFileSync(filename, result.evidence);
-    console.log(`\n📝 Evidence log saved to: ${filename}`);
-  }
+  // Always save detailed reasoning log
+  const fs = await import('fs');
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const filename = `reasoning-${timestamp}.json`;
+  
+  const reasoningLog = {
+    goal,
+    provider: MODELS.provider,
+    models: MODELS.models,
+    executionTime: result.executionTime,
+    plan: result.plan,
+    evidence: JSON.parse(result.evidence),
+    finalResult: result.final,
+    timestamp: new Date().toISOString(),
+  };
+  
+  fs.writeFileSync(filename, JSON.stringify(reasoningLog, null, 2));
+  console.log(`\n📝 Detailed reasoning saved to: ${filename}`);
   
   return result;
 }
