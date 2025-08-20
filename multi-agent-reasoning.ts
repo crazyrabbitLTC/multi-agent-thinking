@@ -157,6 +157,20 @@ class EvidenceLog {
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
+// Source Analysis Types
+// ────────────────────────────────────────────────────────────────────────────────
+
+interface SourceAnalysis {
+  url: string;
+  domain: string;
+  relevanceScore: number; // 0.0-1.0
+  authority: 'High' | 'Medium' | 'Low';
+  publicationDate?: string;
+  keyFacts: string[];
+  contentQuality: string;
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
 // Retriever (GraphRAG placeholder)
 // Return an evidence graph {nodes, edges, sources}
 // ────────────────────────────────────────────────────────────────────────────────
@@ -238,7 +252,7 @@ class Retriever {
       try {
         logProgress(`Searching web for: ${query}`, 3);
         
-        // Use Groq's browser search to get real information
+        // Use Groq's browser search with simplified analytical reading
         const { text } = await generateText({
           model: MODELS.solver,
           prompt: `Search for information about: ${query}. Provide factual information with specific sources and URLs.`,
@@ -251,27 +265,68 @@ class Retriever {
               reasoningEffort: 'medium',
             },
           },
+          maxRetries: 1, // Limit retries to prevent hanging
+          retryDelay: 2000,
         });
         
-        logSuccess('Retrieved real web information', 3);
+        logSuccess('Retrieved analytical web research', 3);
         
-        // Parse the response to extract sources
-        const urlPattern = /https?:\/\/[^\s\)\]]+/g;
-        const foundUrls = text.match(urlPattern) || [];
-        const sources = foundUrls.length > 0 ? foundUrls : ['https://web-search-results'];
+        // DEBUG: Log raw response to understand format
+        logProgress(`Debug - Response preview: ${text.substring(0, 300)}...`, 4);
+        
+        // Parse structured source analysis
+        const sourceAnalysis = this.parseSourceAnalysis(text);
+        logProgress(`Raw parsing found ${sourceAnalysis.length} sources`, 4);
+        
+        const qualitySources = sourceAnalysis.filter(s => s.relevanceScore > 0.3);
+        const sourceUrls = qualitySources.map(s => s.url);
+        
+        logProgress(
+          `Analyzed ${sourceAnalysis.length} sources, selected ${qualitySources.length} quality sources`, 
+          3
+        );
+        
+        // Debug logging if no sources found
+        if (sourceAnalysis.length === 0) {
+          logError('No sources parsed from search response!', 3);
+          logProgress(`Response preview: ${text.substring(0, 200)}...`, 4);
+        }
+        
+        // Log source quality summary
+        if (qualitySources.length > 0) {
+          const avgRelevance = qualitySources.reduce((sum, s) => sum + s.relevanceScore, 0) / qualitySources.length;
+          const highAuthority = qualitySources.filter(s => s.authority === 'High').length;
+          logProgress(
+            `Average relevance: ${avgRelevance.toFixed(2)}, High authority sources: ${highAuthority}`, 
+            4
+          );
+        }
         
         const result = {
-          nodes: [{ id: 'web_search', type: 'search_result', text: text }],
+          nodes: [{ 
+            id: 'web_search', 
+            type: 'search_result', 
+            text: text,
+            sourceAnalysis: sourceAnalysis // Include detailed analysis
+          }],
           edges: [],
-          sources: sources,
+          sources: sourceUrls.length > 0 ? sourceUrls : this.extractFallbackUrls(text),
+          sourceMetadata: {
+            totalAnalyzed: sourceAnalysis.length,
+            qualityCount: qualitySources.length,
+            averageRelevance: qualitySources.length > 0 ? 
+              qualitySources.reduce((sum, s) => sum + s.relevanceScore, 0) / qualitySources.length : 0,
+            highAuthorityCount: qualitySources.filter(s => s.authority === 'High').length,
+            publicationDates: qualitySources.filter(s => s.publicationDate).length
+          }
         } as const;
         
-        // Cache the result
+        // Cache the result and RETURN IMMEDIATELY
         this.searchCache.set(cacheKey, result);
         return result;
       } catch (error) {
         logError(`Web search failed: ${error instanceof Error ? error.message : 'Unknown error'}`, 3);
-        // Fall back to placeholder
+        // Continue to fallback logic below
       }
     }
     
@@ -284,11 +339,206 @@ class Retriever {
       ['https://example.com/source'] : 
       ['internal-knowledge']; // Indicate this is knowledge-based
     
+    logProgress(`Using fallback sources: ${sources.join(', ')}`, 3);
     return {
       nodes: [{ id: 'knowledge', type: shouldSearch ? 'claim' : 'knowledge', text: evidenceText }],
       edges: [],
       sources: sources,
     } as const;
+  }
+
+  private parseSourceAnalysis(text: string): SourceAnalysis[] {
+    const sources: SourceAnalysis[] = [];
+    
+    // First try structured parsing (our requested format)
+    const structuredSources = this.parseStructuredFormat(text);
+    if (structuredSources.length > 0) {
+      return structuredSources;
+    }
+    
+    // Then try Groq's native format parsing
+    const groqSources = this.parseGroqFormat(text);
+    if (groqSources.length > 0) {
+      return groqSources;
+    }
+    
+    // Final fallback: regex URL extraction
+    return this.parseRegexFallback(text);
+  }
+
+  private parseStructuredFormat(text: string): SourceAnalysis[] {
+    const sources: SourceAnalysis[] = [];
+    const sourceSections = text.split('---').filter(section => 
+      section.includes('**URL:**') && section.trim().length > 50
+    );
+    
+    for (const section of sourceSections) {
+      try {
+        const analysis = this.extractSourceData(section);
+        if (analysis) sources.push(analysis);
+      } catch (error) {
+        logProgress(`Structured parsing failed: ${error.message}`, 4);
+      }
+    }
+    
+    return sources;
+  }
+
+  private parseGroqFormat(text: string): SourceAnalysis[] {
+    const sources: SourceAnalysis[] = [];
+    
+    // Look for Groq's search result format: 【0†Title†domain】
+    const groqPattern = /【\d+†([^†]+)†([^】]+)】/g;
+    let match;
+    
+    while ((match = groqPattern.exec(text)) !== null) {
+      const title = match[1];
+      const domain = match[2];
+      
+      // Assess authority based on domain
+      const authority = this.assessDomainAuthority(domain);
+      
+      // Assess relevance based on title content
+      const relevance = this.assessTitleRelevance(title);
+      
+      sources.push({
+        url: `https://${domain}`, // Construct URL
+        domain: domain,
+        relevanceScore: relevance,
+        authority: authority,
+        keyFacts: [title], // Use title as key fact
+        contentQuality: `Groq search result: ${title}`
+      });
+    }
+    
+    // Also extract any direct URLs found
+    const directUrls = this.extractDirectUrls(text);
+    for (const url of directUrls) {
+      const domain = this.extractDomain(url);
+      sources.push({
+        url,
+        domain,
+        relevanceScore: 0.7, // Higher for direct URLs
+        authority: this.assessDomainAuthority(domain),
+        keyFacts: [],
+        contentQuality: 'Direct URL found'
+      });
+    }
+    
+    return sources;
+  }
+
+  private parseRegexFallback(text: string): SourceAnalysis[] {
+    const urlPattern = /https?:\/\/[^\s\)\]]+/g;
+    const foundUrls = text.match(urlPattern) || [];
+    
+    return foundUrls.map(url => ({
+      url,
+      domain: this.extractDomain(url),
+      relevanceScore: 0.5,
+      authority: 'Medium' as const,
+      keyFacts: [],
+      contentQuality: 'Regex fallback'
+    }));
+  }
+
+  private extractDirectUrls(text: string): string[] {
+    const urlPattern = /https?:\/\/[^\s\)\]]+/g;
+    return text.match(urlPattern) || [];
+  }
+
+  private assessDomainAuthority(domain: string): 'High' | 'Medium' | 'Low' {
+    const highAuthority = [
+      'sec.gov', 'treasury.gov', 'federalreserve.gov',
+      'bloomberg.com', 'reuters.com', 'wsj.com', 'ft.com',
+      'marketwatch.com', 'morningstar.com', 'yahoo.com',
+      'stockanalysis.com', 'finviz.com'
+    ];
+    
+    const mediumAuthority = [
+      'cnbc.com', 'cnn.com', 'forbes.com', 'investopedia.com',
+      'seeking.alpha.com', 'fool.com'
+    ];
+    
+    if (highAuthority.some(auth => domain.includes(auth))) return 'High';
+    if (mediumAuthority.some(auth => domain.includes(auth))) return 'Medium';
+    return 'Low';
+  }
+
+  private assessTitleRelevance(title: string): number {
+    // Simple relevance based on financial keywords
+    const financialKeywords = ['stock', 'price', 'quote', 'market', 'earnings', 'dividend', 'analysis'];
+    const matches = financialKeywords.filter(keyword => 
+      title.toLowerCase().includes(keyword)
+    ).length;
+    
+    return Math.min(0.3 + (matches * 0.2), 1.0); // 0.3 base + 0.2 per keyword, max 1.0
+  }
+
+  private extractSourceData(section: string): SourceAnalysis | null {
+    const urlMatch = section.match(/\*\*URL:\*\*\s*(.+)/);
+    const domainMatch = section.match(/\*\*DOMAIN:\*\*\s*(.+)/);
+    const relevanceMatch = section.match(/\*\*RELEVANCE:\*\*\s*(\d*\.?\d+)/);
+    const authorityMatch = section.match(/\*\*AUTHORITY:\*\*\s*(High|Medium|Low)/);
+    const publicationMatch = section.match(/\*\*PUBLICATION:\*\*\s*(.+)/);
+    const contentQualityMatch = section.match(/\*\*CONTENT QUALITY:\*\*\s*(.+)/);
+    
+    if (!urlMatch) return null;
+    
+    const url = urlMatch[1].trim();
+    const domain = domainMatch ? domainMatch[1].trim() : this.extractDomain(url);
+    const relevanceScore = relevanceMatch ? parseFloat(relevanceMatch[1]) : 0.5;
+    const authority = (authorityMatch ? authorityMatch[1] : 'Medium') as 'High' | 'Medium' | 'Low';
+    const publicationDate = publicationMatch ? publicationMatch[1].trim() : undefined;
+    const contentQuality = contentQualityMatch ? contentQualityMatch[1].trim() : 'Not specified';
+    
+    // Extract key facts
+    const keyFacts: string[] = [];
+    const factsSection = section.match(/\*\*KEY FACTS:\*\*([\s\S]*?)(?:\*\*|$)/);
+    if (factsSection) {
+      const factLines = factsSection[1].split('\n')
+        .map(line => line.trim())
+        .filter(line => line.startsWith('-'))
+        .map(line => line.substring(1).trim());
+      keyFacts.push(...factLines);
+    }
+    
+    return {
+      url,
+      domain,
+      relevanceScore: Math.max(0, Math.min(1, relevanceScore)), // Clamp to 0-1
+      authority,
+      publicationDate: publicationDate === 'Not specified' ? undefined : publicationDate,
+      keyFacts,
+      contentQuality
+    };
+  }
+
+  private extractDomain(url: string): string {
+    try {
+      return new URL(url).hostname;
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  private extractFallbackUrls(text: string): string[] {
+    logProgress('Attempting fallback URL extraction', 4);
+    const urlPattern = /https?:\/\/[^\s\)\]]+/g;
+    const foundUrls = text.match(urlPattern) || [];
+    
+    // Clean and deduplicate URLs
+    const cleanUrls = [...new Set(foundUrls)]
+      .filter(url => !url.includes('example.com'))
+      .slice(0, 10); // Limit to 10 URLs max
+    
+    if (cleanUrls.length > 0) {
+      logProgress(`Fallback extracted ${cleanUrls.length} URLs`, 4);
+      return cleanUrls;
+    } else {
+      logError('No URLs found even in fallback extraction!', 4);
+      return ['https://web-search-results']; // Final fallback
+    }
   }
 }
 
@@ -571,7 +821,7 @@ class Judge {
       judgeNote = 'Evaluate logical accuracy and completeness. External citations not required.';
     } else {
       evaluationMode = 'citation_required';
-      judgeNote = 'This requires factual verification with external sources.';
+      judgeNote = 'This requires factual verification with external sources. CRITICAL: You can only verify against sources that were provided in the research phase. Do not search for or use new sources.';
       logProgress('Judge mode: citation_required (no real sources found)', 3);
     }
     
@@ -584,7 +834,9 @@ class Judge {
       has_real_sources: hasRealSources,
       note: judgeNote,
       critical_instruction: subtask.kind === 'verify' ? 
-        'You are verifying the previous reasoning step. Use the SAME sources that were used in the research phase. Do not abandon real sources for internal knowledge.' :
+        hasRealSources ? 
+          'You are verifying the previous reasoning step. Use ONLY the sources that were found in the research phase. Do not abandon real sources for internal knowledge.' :
+          'You are verifying the previous reasoning step. The research phase used placeholder/internal sources only. Do not introduce new external sources. Verify based on logical consistency and known facts only.' :
         'Evaluate this step for accuracy and completeness.'
     };
     
