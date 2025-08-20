@@ -99,6 +99,7 @@ function createModels(provider: ModelProvider) {
         judge: openai('gpt-4o'),
         provider: 'OpenAI' as const,
         models: 'GPT-4o-mini (planner/solver), GPT-4o (judge)' as const,
+        browserSearch: undefined, // OpenAI doesn't have browser search
       };
     }
     case 'groq': {
@@ -109,6 +110,7 @@ function createModels(provider: ModelProvider) {
         judge: groq('openai/gpt-oss-120b'),           // Most powerful for validation
         provider: 'Groq' as const,
         models: 'GPT-OSS-20B (planner/solver), GPT-OSS-120B (judge)' as const,
+        browserSearch: groq.tools.browserSearch({}),  // Browser search tool
       };
     }
     default:
@@ -160,8 +162,120 @@ class EvidenceLog {
 // ────────────────────────────────────────────────────────────────────────────────
 
 class Retriever {
-  async retrieve(query: string) {
-    // TODO: replace with your GraphRAG implementation and real sources/IDs
+  private searchCache = new Map<string, any>();
+  
+  constructor(private useRealSearch: boolean = false) {}
+  
+  // Determine if a query needs web search or can be answered with internal knowledge
+  private needsWebSearch(query: string, goal: string): boolean {
+    const queryLower = query.toLowerCase();
+    const goalLower = goal.toLowerCase();
+    const combinedText = `${queryLower} ${goalLower}`;
+    
+    // Categories that DON'T need web search
+    const mathKeywords = ['calculate', 'solve', 'equation', 'derivative', 'integral', 'algebra', 'geometry', 'arithmetic', '+', '-', '*', '/', '=', 'formula', 'theorem', 'proof', 'math'];
+    const codeKeywords = ['code', 'programming', 'function', 'algorithm', 'debug', 'syntax', 'variable', 'loop', 'class', 'method', 'python', 'javascript', 'typescript'];
+    const conceptualKeywords = ['what is', 'define', 'explain', 'how does', 'how to', 'difference between', 'compare', 'concept of', 'meaning of'];
+    const technicalKeywords = ['machine learning', 'ai', 'database', 'api', 'framework', 'library', 'protocol', 'encryption', 'security'];
+    
+    // Categories that DO need web search
+    const currentEventKeywords = ['latest', 'recent', 'current', 'today', 'this year', '2024', '2025', 'breaking news', 'update'];
+    const factualKeywords = ['who is', 'when did', 'where is', 'capital of', 'population of', 'price of', 'stock price', 'weather', 'news'];
+    
+    // First check if it needs current information
+    if (currentEventKeywords.some(keyword => combinedText.includes(keyword))) {
+      logProgress('Detected current events - using web search', 3);
+      return true;
+    }
+    
+    if (factualKeywords.some(keyword => combinedText.includes(keyword))) {
+      logProgress('Detected specific factual query - using web search', 3);
+      return true;
+    }
+    
+    // Skip web search for knowledge-based questions
+    if (mathKeywords.some(keyword => combinedText.includes(keyword))) {
+      logProgress('Detected math/calculation - skipping web search', 3);
+      return false;
+    }
+    
+    if (codeKeywords.some(keyword => combinedText.includes(keyword))) {
+      logProgress('Detected programming question - skipping web search', 3);
+      return false;
+    }
+    
+    if (conceptualKeywords.some(keyword => combinedText.includes(keyword))) {
+      logProgress('Detected conceptual question - skipping web search', 3);
+      return false;
+    }
+    
+    if (technicalKeywords.some(keyword => combinedText.includes(keyword))) {
+      logProgress('Detected technical explanation - skipping web search', 3);
+      return false;
+    }
+    
+    // Default: use web search for ambiguous queries
+    logProgress('Query type unclear - using web search as fallback', 3);
+    return true;
+  }
+  
+  async retrieve(query: string, subtaskKind: SubtaskKind = 'research', goal: string = '') {
+    // Only do web search for research tasks, not for reasoning or verification
+    const shouldSearch = this.useRealSearch && 
+                        MODELS.provider === 'Groq' && 
+                        MODELS.browserSearch && 
+                        subtaskKind === 'research' &&
+                        this.needsWebSearch(query, goal);
+    
+    if (shouldSearch) {
+      // Check cache first
+      const cacheKey = `search:${query}`;
+      if (this.searchCache.has(cacheKey)) {
+        logProgress('Using cached search results', 3);
+        return this.searchCache.get(cacheKey);
+      }
+      
+      try {
+        logProgress(`Searching web for: ${query}`, 3);
+        
+        // Use Groq's browser search to get real information
+        const { text } = await generateText({
+          model: MODELS.solver,
+          prompt: `Search for information about: ${query}. Provide factual information with specific sources and URLs.`,
+          tools: {
+            browser_search: MODELS.browserSearch,
+          },
+          toolChoice: 'required',
+          providerOptions: {
+            groq: {
+              reasoningEffort: 'medium',
+            },
+          },
+        });
+        
+        logSuccess('Retrieved real web information', 3);
+        
+        // Parse the response to extract sources
+        const urlPattern = /https?:\/\/[^\s\)\]]+/g;
+        const foundUrls = text.match(urlPattern) || [];
+        const sources = foundUrls.length > 0 ? foundUrls : ['https://web-search-results'];
+        
+        const result = {
+          nodes: [{ id: 'web_search', type: 'search_result', text: text }],
+          edges: [],
+          sources: sources,
+        } as const;
+        
+        // Cache the result
+        this.searchCache.set(cacheKey, result);
+        return result;
+      } catch (error) {
+        logError(`Web search failed: ${error instanceof Error ? error.message : 'Unknown error'}`, 3);
+        // Fall back to placeholder
+      }
+    }
+    
+    // For non-research tasks or when search is disabled/fails
     return {
       nodes: [{ id: 'claim1', type: 'claim', text: `Evidence for: ${query}` }],
       edges: [],
@@ -245,12 +359,17 @@ class Planner {
 class Solver {
   constructor(private retriever: Retriever) {}
 
-  async propose(subtask: Subtask, context: Record<string, any>, k = 3) {
+  async propose(subtask: Subtask, context: Record<string, any>, k = 3, goal: string = '') {
     logProgress(`Generating ${k} proposals for ${subtask.kind} task: ${subtask.id}`, 2);
-    const retrieval = await this.retriever.retrieve(subtask.prompt);
-    const proposals: Array<{ text: string; citations: string[]; evidence: any }> = [];
-
-    for (let i = 0; i < k; i++) {
+    const retrieval = await this.retriever.retrieve(subtask.prompt, subtask.kind, goal);
+    
+    // Generate proposals in parallel with rate limiting delay
+    const proposalPromises = Array.from({ length: k }, async (_, i) => {
+      // Add delay between requests to avoid rate limits
+      if (i > 0 && MODELS.provider === 'Groq') {
+        await new Promise(resolve => setTimeout(resolve, 2000)); // 2 second delay
+      }
+      
       logProgress(`Proposal ${i + 1}/${k}`, 3);
       const system = `You are the ${subtask.kind} specialist. Use the evidence graph and be concise but precise. Cite sources explicitly.`;
       
@@ -258,7 +377,7 @@ class Solver {
         model: MODELS.solver,
         system,
         prompt: JSON.stringify({ subtask, context, evidence_graph: retrieval }),
-        temperature: 0.6,
+        temperature: 0.6 + (i * 0.1), // Slight temperature variation for diversity
       };
       
       // Add reasoning effort for Groq GPT-OSS models
@@ -270,10 +389,21 @@ class Solver {
         };
       }
       
-      const { text } = await generateText(generateOptions);
-      proposals.push({ text, citations: retrieval.sources, evidence: retrieval });
-    }
-
+      try {
+        const { text } = await generateText(generateOptions);
+        return { text, citations: retrieval.sources, evidence: retrieval };
+      } catch (error) {
+        logError(`Proposal ${i + 1} failed: ${error instanceof Error ? error.message : 'Unknown error'}`, 3);
+        // Return a fallback proposal
+        return {
+          text: `Fallback proposal ${i + 1}: Unable to generate due to rate limits or other issues.`,
+          citations: retrieval.sources,
+          evidence: retrieval,
+        };
+      }
+    });
+    
+    const proposals = await Promise.all(proposalPromises);
     logSuccess(`Generated ${proposals.length} proposals for ${subtask.id}`, 2);
     return proposals;
   }
@@ -291,16 +421,63 @@ class Solver {
 
 class Judge {
   constructor(private tooling: Tooling) {}
+  
+  // Determine if citations are required based on question type
+  private requiresCitations(goal: string): boolean {
+    const goalLower = goal.toLowerCase();
+    
+    // Questions that DON'T need citations (knowledge/logic based)
+    const mathKeywords = ['calculate', 'solve', 'equation', 'derivative', 'integral', 'algebra', 'geometry', 'arithmetic', '+', '-', '*', '/', '=', 'formula', 'theorem', 'proof', 'math'];
+    const codeKeywords = ['code', 'programming', 'function', 'algorithm', 'debug', 'syntax', 'variable', 'loop', 'class', 'method', 'python', 'javascript', 'typescript'];
+    const conceptualKeywords = ['what is', 'define', 'explain', 'how does', 'how to', 'difference between', 'compare', 'concept of', 'meaning of', 'definition of'];
+    const technicalKeywords = ['machine learning', 'ai', 'database', 'api', 'framework', 'library', 'protocol', 'encryption', 'security', 'network'];
+    
+    // Questions that DO need citations (factual/current)
+    const citationRequiredKeywords = ['latest', 'recent', 'current', 'today', 'this year', '2024', '2025', 'breaking news', 'update', 'who is', 'when did', 'population of', 'capital of', 'price of', 'stock price', 'weather', 'news', 'event'];
+    
+    // First check if it explicitly needs citations
+    if (citationRequiredKeywords.some(keyword => goalLower.includes(keyword))) {
+      return true;
+    }
+    
+    // Then check if it's knowledge-based (doesn't need citations)
+    if (mathKeywords.some(keyword => goalLower.includes(keyword)) ||
+        codeKeywords.some(keyword => goalLower.includes(keyword)) ||
+        conceptualKeywords.some(keyword => goalLower.includes(keyword)) ||
+        technicalKeywords.some(keyword => goalLower.includes(keyword))) {
+      return false;
+    }
+    
+    // Default: require citations for ambiguous questions
+    return true;
+  }
 
-  async inspect(subtask: Subtask, artifact: Record<string, any>) {
+  async inspect(subtask: Subtask, artifact: Record<string, any>, goal: string = '') {
     logProgress(`Judging artifact for ${subtask.id}`, 2);
     const tests = await this.tooling.runTests(artifact);
-    const system = 'You are a strict verifier. Check factuality vs citations and logical consistency.';
+    const needsCitations = this.requiresCitations(goal);
+    
+    let system = 'You are a strict verifier. ';
+    if (needsCitations) {
+      system += 'Check factuality against citations and logical consistency. Penalize unsupported factual claims.';
+    } else {
+      system += 'Focus on logical consistency and mathematical/technical accuracy. Citations are not required for math, calculations, or code - the logic itself is the evidence.';
+    }
+    
+    const judgePrompt = {
+      subtask,
+      artifact, 
+      tests,
+      evaluation_mode: needsCitations ? 'citation_required' : 'logic_based',
+      note: needsCitations ? 
+        'This question requires factual citations and sources.' : 
+        'This is a math/code question - evaluate the logic, not citations.'
+    };
     
     const generateOptions: any = {
       model: MODELS.judge,
       system,
-      prompt: JSON.stringify({ subtask, artifact, tests }),
+      prompt: JSON.stringify(judgePrompt),
       temperature: 0,
     };
     
@@ -355,13 +532,21 @@ class Orchestrator {
       const batch = ready();
       if (batch.length === 0) throw new Error('Deadlock in plan dependencies');
 
-      for (const sub of batch) {
+      // Process batch in parallel when possible
+      const batchPromises = batch.map(async (sub) => {
         taskCount++;
         console.log(`\n[${taskCount}/${plan.subtasks.length}] Processing subtask: ${sub.id} (${sub.kind})`);
-        const artifact = await this.executeSubtask(sub, artifacts);
-        artifacts[sub.id] = artifact;
-        done.add(sub.id);
-        logSuccess(`Completed subtask ${sub.id}`, 1);
+        const artifact = await this.executeSubtask(sub, artifacts, goal);
+        return { id: sub.id, artifact };
+      });
+      
+      const results = await Promise.all(batchPromises);
+      
+      // Update artifacts and mark as done
+      for (const { id, artifact } of results) {
+        artifacts[id] = artifact;
+        done.add(id);
+        logSuccess(`Completed subtask ${id}`, 1);
       }
     }
 
@@ -373,14 +558,16 @@ class Orchestrator {
     return { final, evidence: this.log.toJSON(), plan, executionTime: totalTime } as const;
   }
 
-  private async executeSubtask(sub: Subtask, artifacts: Record<ID, Record<string, any>>) {
+  private async executeSubtask(sub: Subtask, artifacts: Record<ID, Record<string, any>>, goal: string) {
     const context = Object.fromEntries((sub.deps ?? []).map(d => [d, artifacts[d]]));
     const startTime = Date.now();
 
     let lastCandidate: Record<string, any> | undefined;
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       logProgress(`Attempt ${attempt + 1}/${this.maxRetries + 1}`, 1);
-      const proposals = await this.solver.propose(sub, context, sub.kind === 'verify' ? 2 : 3);
+      // Reduce proposals for Groq to manage rate limits
+      const proposalCount = MODELS.provider === 'Groq' ? 2 : (sub.kind === 'verify' ? 2 : 3);
+      const proposals = await this.solver.propose(sub, context, proposalCount, goal);
       const candidate = this.solver.vote(proposals);
 
       this.log.add({
@@ -391,7 +578,7 @@ class Orchestrator {
         citations: candidate.citations,
       });
 
-      const { passed, info } = await this.judge.inspect(sub, candidate);
+      const { passed, info } = await this.judge.inspect(sub, candidate, goal);
       this.log.add({ stepId: `${sub.id}:${attempt}`, role: 'judge', input: { artifact: candidate }, output: info });
 
       if (passed) {
@@ -431,7 +618,12 @@ function printUsage() {
   console.log('Models:');
   console.log('  OpenAI: GPT-4o-mini (planner/solver), GPT-4o (judge)');
   console.log('  Groq:   GPT-OSS-20B (planner/solver), GPT-OSS-120B (judge)\n');
-  console.log('Note: Groq\'s GPT-OSS models support reasoning and browser search tools');
+  console.log('Features:');
+  console.log('  OpenAI: Advanced reasoning, placeholder citations');
+  console.log('  Groq:   Smart web search, real citations, reasoning effort\n');
+  console.log('Smart Search Logic:');
+  console.log('  🔍 Web search: Current events, facts, specific queries');
+  console.log('  🧠 No search: Math, code, concepts, definitions, how-to\n');
 }
 
 export async function runMultiAgentReasoning(goal: string, provider: ModelProvider = 'openai') {
@@ -443,12 +635,18 @@ export async function runMultiAgentReasoning(goal: string, provider: ModelProvid
   MODELS = createModels(provider);
   console.log(`\n🤖 Using ${MODELS.provider}: ${MODELS.models}`);
 
-  const retriever = new Retriever();
+  // Enable real web search for Groq models
+  const useRealSearch = provider === 'groq';
+  const retriever = new Retriever(useRealSearch);
   const tooling = new Tooling();
   const planner = new Planner();
   const solver = new Solver(retriever);
   const judge = new Judge(tooling);
   const orch = new Orchestrator(planner, solver, judge, 2);
+  
+  if (useRealSearch) {
+    console.log('  🔍 Web search enabled for real citations');
+  }
 
   console.log(`\n🎯 GOAL: ${goal}`);
   const result = await orch.run(goal);

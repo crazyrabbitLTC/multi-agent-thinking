@@ -6,9 +6,11 @@ A TypeScript implementation of a multi-agent reasoning system using the Planner 
 
 - 🧠 **Multi-Agent Architecture**: Planner decomposes goals, Solvers generate proposals, Judge validates results
 - ⚡ **Multiple AI Providers**: Support for OpenAI and Groq models
+- 🔍 **Real Web Search**: Groq models use browser search for authentic citations
 - 🔄 **Real-time Progress**: Visual feedback with timing information
 - 📊 **Evidence Logging**: Complete audit trail of reasoning process
 - 🎯 **CLI Interface**: Simple command-line usage
+- ⚡ **Parallel Processing**: Optimized for speed with rate limit management
 
 ## Installation
 
@@ -39,11 +41,16 @@ SAVE_EVIDENCE=1
 ## Usage
 
 ```bash
-# Using OpenAI (default)
-npx tsx multi-agent-reasoning.ts "Explain quantum computing basics"
+# Math/conceptual (no web search needed)
+npx tsx multi-agent-reasoning.ts -m groq "What is the derivative of x^2?"
+npx tsx multi-agent-reasoning.ts -m groq "Explain machine learning"
 
-# Using Groq
-npx tsx multi-agent-reasoning.ts -m groq "How does blockchain work?"
+# Current events/facts (web search enabled)
+npx tsx multi-agent-reasoning.ts -m groq "Latest AI developments 2024"
+npx tsx multi-agent-reasoning.ts -m groq "What is the capital of Japan?"
+
+# OpenAI (always uses placeholder citations)
+npx tsx multi-agent-reasoning.ts "Any question works"
 
 # Get help
 npx tsx multi-agent-reasoning.ts --help
@@ -74,18 +81,37 @@ npx tsx multi-agent-reasoning.ts --help
 
 - **Planner**: Decomposes complex goals into atomic subtasks
 - **Solver**: Generates multiple proposals using self-consistency
-- **Judge**: Validates outputs against tests and citations
+- **Judge**: Validates outputs (citations for facts, logic for math/concepts)
 - **Orchestrator**: Manages execution flow and evidence logging
+- **Smart Search**: Automatically detects when web search is needed
+
+## Question Types
+
+### 🔍 **Web Search Enabled** (Groq only)
+- Current events: "Latest AI news 2024"
+- Specific facts: "Population of Tokyo", "Stock price of AAPL"
+- Real-time data: "Today's weather", "Recent news"
+
+### 🧠 **Knowledge-Based** (No web search)
+- Math: "Calculate derivative", "Solve equation"
+- Programming: "Write Python function", "Explain algorithms"
+- Concepts: "What is machine learning?", "Define photosynthesis"
+- How-to: "How does encryption work?"
 
 ## Supported Models
 
 ### OpenAI
-- GPT-4o, GPT-4o-mini for planning and solving
-- Different models for judging to reduce bias
+- GPT-4o-mini for planning and solving
+- GPT-4o for judging to reduce bias
+- Uses placeholder citations
 
-### Groq
-- Llama 3.3 70B, Gemma 2 9B for fast inference
-- Reasoning models like Qwen QwQ 32B
+### Groq  
+- GPT-OSS-20B for planning and solving (20B parameters)
+- GPT-OSS-120B for judging with maximum capability (120B parameters)
+- **Smart browser search** for factual queries only
+- **Logic-based evaluation** for math/conceptual questions
+- Reasoning effort optimization (medium/high)
+- Rate limit management with parallel processing
 
 ## Development
 
