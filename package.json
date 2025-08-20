@@ -1,0 +1,21 @@
+{
+  "name": "test-multi-agent-thinking",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@ai-sdk/groq": "^2.0.11",
+    "@ai-sdk/openai": "^2.0.16",
+    "@types/node": "^24.3.0",
+    "ai": "^5.0.18",
+    "tsx": "^4.20.4",
+    "typescript": "^5.9.2",
+    "zod": "^3.25.76"
+  }
+}
