@@ -38,22 +38,68 @@ GROQ_API_KEY=your_groq_api_key_here
 SAVE_EVIDENCE=1
 ```
 
-## Usage
+## CLI Commands
 
+### Basic Usage
 ```bash
-# Math/conceptual (no web search needed)
-npx tsx multi-agent-reasoning.ts -m groq "What is the derivative of x^2?"
-npx tsx multi-agent-reasoning.ts -m groq "Explain machine learning"
+npx tsx multi-agent-reasoning.ts [OPTIONS] "<your goal here>"
+```
 
-# Current events/facts (web search enabled)
+### Available Options
+- `-m, --model PROVIDER` - Choose AI provider: `openai` (default) or `groq`
+- `-s, --search MODE` - Search behavior: `always`, `never`, or `auto` (default)
+- `-h, --help` - Show help message
+
+### Command Examples
+
+#### Model Selection
+```bash
+# Use OpenAI (default)
+npx tsx multi-agent-reasoning.ts "Explain quantum computing"
+
+# Use Groq models with web search
 npx tsx multi-agent-reasoning.ts -m groq "Latest AI developments 2024"
-npx tsx multi-agent-reasoning.ts -m groq "What is the capital of Japan?"
+```
 
-# OpenAI (always uses placeholder citations)
-npx tsx multi-agent-reasoning.ts "Any question works"
+#### Search Control
+```bash
+# Force web search (when available)
+npx tsx multi-agent-reasoning.ts -s always "Current weather in Tokyo"
 
-# Get help
+# Use only internal knowledge
+npx tsx multi-agent-reasoning.ts -s never "Basic calculus concepts"
+
+# Smart auto-detection (default)
+npx tsx multi-agent-reasoning.ts -s auto "Machine learning basics"
+```
+
+#### Math and Conceptual Questions
+```bash
+# Math problems (no web search needed)
+npx tsx multi-agent-reasoning.ts "What is the derivative of x^2?"
+npx tsx multi-agent-reasoning.ts -m groq "Solve: 2x + 5 = 15"
+
+# Conceptual explanations
+npx tsx multi-agent-reasoning.ts "How does machine learning work?"
+npx tsx multi-agent-reasoning.ts -m groq "Explain blockchain technology"
+```
+
+#### Current Events and Facts
+```bash
+# Current events (web search enabled with Groq)
+npx tsx multi-agent-reasoning.ts -m groq "Latest AI developments 2024"
+npx tsx multi-agent-reasoning.ts -m groq "Recent tech news"
+
+# Factual queries
+npx tsx multi-agent-reasoning.ts -m groq "Population of Tokyo 2024"
+npx tsx multi-agent-reasoning.ts -m groq "Current Bitcoin price"
+```
+
+#### Help and Information
+```bash
+# Show help message
 npx tsx multi-agent-reasoning.ts --help
+npx tsx multi-agent-reasoning.ts -h
 ```
 
 ## Example Output

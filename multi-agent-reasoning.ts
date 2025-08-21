@@ -178,53 +178,66 @@ interface SourceAnalysis {
 class Retriever {
   private searchCache = new Map<string, any>();
   
-  constructor(private useRealSearch: boolean = false) {}
+  constructor(private useRealSearch: boolean = false, private searchMode: 'always' | 'never' | 'auto' = 'auto') {}
   
-  // Determine if a query needs web search or can be answered with internal knowledge
+  // Determine search strategy based on query confidence levels
   private needsWebSearch(query: string, goal: string): boolean {
+    // Override based on search mode
+    if (this.searchMode === 'always') {
+      logProgress('Search mode: ALWAYS - forcing web search', 3);
+      return true;
+    }
+    
+    if (this.searchMode === 'never') {
+      logProgress('Search mode: NEVER - using internal knowledge', 3);
+      return false;
+    }
+    
+    // Auto mode - use smart detection
     const queryLower = query.toLowerCase();
     const goalLower = goal.toLowerCase();
     const combinedText = `${queryLower} ${goalLower}`;
     
-    // Categories that DON'T need web search
-    const mathKeywords = ['calculate', 'solve', 'equation', 'derivative', 'integral', 'algebra', 'geometry', 'arithmetic', '+', '-', '*', '/', '=', 'formula', 'theorem', 'proof', 'math'];
-    const codeKeywords = ['code', 'programming', 'function', 'algorithm', 'debug', 'syntax', 'variable', 'loop', 'class', 'method', 'python', 'javascript', 'typescript'];
-    const conceptualKeywords = ['what is', 'define', 'explain', 'how does', 'how to', 'difference between', 'compare', 'concept of', 'meaning of'];
-    const technicalKeywords = ['machine learning', 'ai', 'database', 'api', 'framework', 'library', 'protocol', 'encryption', 'security'];
+    // High confidence internal knowledge (very stable topics)
+    const stableKnowledgeKeywords = ['calculate', 'solve', 'equation', 'derivative', 'integral', 'algebra', 'geometry', 'arithmetic', '+', '-', '*', '/', '=', 'formula', 'theorem', 'proof', 'basic math'];
     
-    // Categories that DO need web search
-    const currentEventKeywords = ['latest', 'recent', 'current', 'today', 'this year', '2024', '2025', 'breaking news', 'update'];
-    const factualKeywords = ['who is', 'when did', 'where is', 'capital of', 'population of', 'price of', 'stock price', 'weather', 'news'];
+    // Always needs external search (time-sensitive or factual)
+    const requiresSearchKeywords = ['latest', 'recent', 'current', 'today', 'this year', '2024', '2025', 'breaking news', 'update', 'who is', 'when did', 'where is', 'capital of', 'population of', 'price of', 'stock price', 'weather', 'news'];
     
-    // First check if it needs current information
-    if (currentEventKeywords.some(keyword => combinedText.includes(keyword))) {
-      logProgress('Detected current events - using web search', 3);
+    // Technical topics that evolve rapidly (should search but with internal knowledge backup)
+    const evolvingTechnicalKeywords = ['machine learning', 'ai', 'framework', 'library', 'api', 'security', 'cryptocurrency', 'blockchain'];
+    
+    // Recency indicators (strong signal for search)
+    const recencyIndicators = ['best practices', 'modern', 'new', 'updated', 'v2', 'v3', 'latest version', 'current approach'];
+    
+    // Strong indicators for search
+    if (requiresSearchKeywords.some(keyword => combinedText.includes(keyword))) {
+      logProgress('Detected time-sensitive query - using web search', 3);
       return true;
     }
     
-    if (factualKeywords.some(keyword => combinedText.includes(keyword))) {
-      logProgress('Detected specific factual query - using web search', 3);
+    if (recencyIndicators.some(keyword => combinedText.includes(keyword))) {
+      logProgress('Detected recency requirement - using web search', 3);
       return true;
     }
     
-    // Skip web search for knowledge-based questions
-    if (mathKeywords.some(keyword => combinedText.includes(keyword))) {
-      logProgress('Detected math/calculation - skipping web search', 3);
+    // Only skip search for truly stable knowledge
+    if (stableKnowledgeKeywords.some(keyword => combinedText.includes(keyword))) {
+      logProgress('Detected stable mathematical knowledge - using internal knowledge', 3);
       return false;
     }
     
-    if (codeKeywords.some(keyword => combinedText.includes(keyword))) {
-      logProgress('Detected programming question - skipping web search', 3);
-      return false;
+    // For evolving technical topics, prefer search but don't require it
+    if (evolvingTechnicalKeywords.some(keyword => combinedText.includes(keyword))) {
+      logProgress('Detected evolving technical topic - using web search for latest info', 3);
+      return true;
     }
     
-    if (conceptualKeywords.some(keyword => combinedText.includes(keyword))) {
-      logProgress('Detected conceptual question - skipping web search', 3);
-      return false;
-    }
-    
-    if (technicalKeywords.some(keyword => combinedText.includes(keyword))) {
-      logProgress('Detected technical explanation - skipping web search', 3);
+    // Basic conceptual questions without recency needs
+    const basicConceptualKeywords = ['what is', 'define', 'explain', 'difference between', 'how does'];
+    if (basicConceptualKeywords.some(keyword => combinedText.includes(keyword)) && 
+        !evolvingTechnicalKeywords.some(keyword => combinedText.includes(keyword))) {
+      logProgress('Detected basic conceptual question - using internal knowledge', 3);
       return false;
     }
     
@@ -252,10 +265,16 @@ class Retriever {
       try {
         logProgress(`Searching web for: ${query}`, 3);
         
-        // Use Groq's browser search with simplified analytical reading
+        // Use Groq's browser search with query-specific evaluation
         const { text } = await generateText({
           model: MODELS.solver,
-          prompt: `Search for information about: ${query}. Provide factual information with specific sources and URLs.`,
+          prompt: `Search for information about: ${query}. 
+          
+          For each source you visit, please note:
+          - Is this source directly relevant to "${query}"?
+          - What specific information does it provide?
+          
+          Provide factual information with specific sources and URLs.`,
           tools: {
             browser_search: MODELS.browserSearch,
           },
@@ -278,11 +297,12 @@ class Retriever {
         const sourceAnalysis = this.parseSourceAnalysis(text);
         logProgress(`Raw parsing found ${sourceAnalysis.length} sources`, 4);
         
-        const qualitySources = sourceAnalysis.filter(s => s.relevanceScore > 0.3);
-        const sourceUrls = qualitySources.map(s => s.url);
+        // Prioritize and limit sources intelligently
+        const prioritizedSources = this.prioritizeAndLimitSources(sourceAnalysis, query);
+        const sourceUrls = prioritizedSources.map(s => s.url);
         
         logProgress(
-          `Analyzed ${sourceAnalysis.length} sources, selected ${qualitySources.length} quality sources`, 
+          `Analyzed ${sourceAnalysis.length} sources, selected ${prioritizedSources.length} priority sources`, 
           3
         );
         
@@ -293,9 +313,9 @@ class Retriever {
         }
         
         // Log source quality summary
-        if (qualitySources.length > 0) {
-          const avgRelevance = qualitySources.reduce((sum, s) => sum + s.relevanceScore, 0) / qualitySources.length;
-          const highAuthority = qualitySources.filter(s => s.authority === 'High').length;
+        if (prioritizedSources.length > 0) {
+          const avgRelevance = prioritizedSources.reduce((sum, s) => sum + s.relevanceScore, 0) / prioritizedSources.length;
+          const highAuthority = prioritizedSources.filter(s => s.authority === 'High').length;
           logProgress(
             `Average relevance: ${avgRelevance.toFixed(2)}, High authority sources: ${highAuthority}`, 
             4
@@ -313,11 +333,11 @@ class Retriever {
           sources: sourceUrls.length > 0 ? sourceUrls : this.extractFallbackUrls(text),
           sourceMetadata: {
             totalAnalyzed: sourceAnalysis.length,
-            qualityCount: qualitySources.length,
-            averageRelevance: qualitySources.length > 0 ? 
-              qualitySources.reduce((sum, s) => sum + s.relevanceScore, 0) / qualitySources.length : 0,
-            highAuthorityCount: qualitySources.filter(s => s.authority === 'High').length,
-            publicationDates: qualitySources.filter(s => s.publicationDate).length
+            priorityCount: prioritizedSources.length,
+            averageRelevance: prioritizedSources.length > 0 ? 
+              prioritizedSources.reduce((sum, s) => sum + s.relevanceScore, 0) / prioritizedSources.length : 0,
+            highAuthorityCount: prioritizedSources.filter(s => s.authority === 'High').length,
+            publicationDates: prioritizedSources.filter(s => s.publicationDate).length
           }
         } as const;
         
@@ -366,8 +386,179 @@ class Retriever {
     return this.parseRegexFallback(text);
   }
 
+  /**
+   * Prioritize and limit sources to manageable number based on relevance, authority, and diversity
+   */
+  private prioritizeAndLimitSources(sources: SourceAnalysis[], query: string, maxSources = 5): SourceAnalysis[] {
+    // First, filter out very low relevance sources
+    const relevantSources = sources.filter(s => s.relevanceScore > 0.4);
+    
+    if (relevantSources.length <= maxSources) {
+      return relevantSources.sort((a, b) => this.calculateSourcePriority(b, query) - this.calculateSourcePriority(a, query));
+    }
+
+    // Group sources by domain and content similarity to ensure diversity
+    const domainGroups = new Map<string, SourceAnalysis[]>();
+    const contentClusters = this.clusterSourcesByContent(relevantSources);
+    
+    // Take best source from each cluster for diversity
+    const clusterRepresentatives = contentClusters.map(cluster => 
+      cluster.sort((a, b) => this.calculateSourcePriority(b, query) - this.calculateSourcePriority(a, query))[0]
+    );
+    
+    // Group representatives by domain
+    for (const source of clusterRepresentatives) {
+      const domain = source.domain;
+      if (!domainGroups.has(domain)) {
+        domainGroups.set(domain, []);
+      }
+      domainGroups.get(domain)!.push(source);
+    }
+
+    // Sort each domain group by priority
+    for (const [domain, domainSources] of domainGroups) {
+      domainSources.sort((a, b) => this.calculateSourcePriority(b, query) - this.calculateSourcePriority(a, query));
+    }
+
+    // Select top sources with domain diversity
+    const prioritized: SourceAnalysis[] = [];
+    const maxPerDomain = Math.max(1, Math.floor(maxSources / domainGroups.size));
+    
+    // First pass: take top sources from each domain
+    for (const [domain, domainSources] of domainGroups) {
+      const count = Math.min(maxPerDomain, domainSources.length);
+      prioritized.push(...domainSources.slice(0, count));
+    }
+
+    // Second pass: fill remaining slots with highest priority sources
+    if (prioritized.length < maxSources) {
+      const remaining = relevantSources
+        .filter(s => !prioritized.includes(s))
+        .sort((a, b) => this.calculateSourcePriority(b, query) - this.calculateSourcePriority(a, query))
+        .slice(0, maxSources - prioritized.length);
+      
+      prioritized.push(...remaining);
+    }
+
+    // Final sort by priority
+    return prioritized
+      .sort((a, b) => this.calculateSourcePriority(b, query) - this.calculateSourcePriority(a, query))
+      .slice(0, maxSources);
+  }
+
+  /**
+   * Calculate source priority score for ranking
+   */
+  private calculateSourcePriority(source: SourceAnalysis, query: string): number {
+    let score = source.relevanceScore * 10; // Base score from relevance
+    
+    // Authority bonus
+    switch (source.authority) {
+      case 'High': score += 5; break;
+      case 'Medium': score += 2; break;
+      case 'Low': score += 0; break;
+    }
+    
+    // Quality indicators (neutral, content-based)
+    const domain = source.domain.toLowerCase();
+    
+    // Bonus for official/government sources (generally authoritative)
+    if (domain.includes('.gov') || domain.includes('.edu')) {
+      score += 2;
+    }
+    
+    // Small bonus for established domains with HTTPS (basic quality signal)
+    if (source.url.startsWith('https://') && !domain.includes('blogspot') && !domain.includes('wordpress')) {
+      score += 1;
+    }
+    
+    // Penalize very long URLs (likely redirects or ads)
+    if (source.url.length > 200) {
+      score -= 2;
+    }
+    
+    // Penalize sources with poor content quality indicators
+    if (source.contentQuality.toLowerCase().includes('ad') || source.contentQuality.toLowerCase().includes('promotion')) {
+      score -= 3;
+    }
+    
+    return score;
+  }
+
+  /**
+   * Cluster sources by content similarity to avoid redundancy
+   */
+  private clusterSourcesByContent(sources: SourceAnalysis[]): SourceAnalysis[][] {
+    const clusters: SourceAnalysis[][] = [];
+    const processed = new Set<SourceAnalysis>();
+
+    for (const source of sources) {
+      if (processed.has(source)) continue;
+
+      const cluster = [source];
+      processed.add(source);
+
+      // Find similar sources
+      for (const other of sources) {
+        if (processed.has(other) || source === other) continue;
+
+        if (this.areSourcesSimilar(source, other)) {
+          cluster.push(other);
+          processed.add(other);
+        }
+      }
+
+      clusters.push(cluster);
+    }
+
+    return clusters;
+  }
+
+  /**
+   * Determine if two sources contain similar content
+   */
+  private areSourcesSimilar(a: SourceAnalysis, b: SourceAnalysis): boolean {
+    // Same domain (likely similar content)
+    if (a.domain === b.domain) return true;
+
+    // Similar key facts (content overlap)
+    const aFacts = a.keyFacts.join(' ').toLowerCase();
+    const bFacts = b.keyFacts.join(' ').toLowerCase();
+    
+    if (aFacts.length === 0 || bFacts.length === 0) return false;
+
+    // Simple similarity check - shared words
+    const aWords = new Set(aFacts.split(/\s+/).filter(w => w.length > 3));
+    const bWords = new Set(bFacts.split(/\s+/).filter(w => w.length > 3));
+    
+    const intersection = new Set([...aWords].filter(x => bWords.has(x)));
+    const union = new Set([...aWords, ...bWords]);
+    
+    const similarity = intersection.size / union.size;
+    return similarity > 0.3; // 30% content overlap indicates similarity
+  }
+
   private parseStructuredFormat(text: string): SourceAnalysis[] {
     const sources: SourceAnalysis[] = [];
+    
+    // Try new enhanced format first
+    const enhancedSections = text.split('---').filter(section => 
+      section.includes('**SOURCE EVALUATION**') && section.trim().length > 50
+    );
+    
+    if (enhancedSections.length > 0) {
+      for (const section of enhancedSections) {
+        try {
+          const analysis = this.extractEnhancedSourceData(section);
+          if (analysis) sources.push(analysis);
+        } catch (error) {
+          logProgress(`Enhanced parsing failed: ${error.message}`, 4);
+        }
+      }
+      return sources;
+    }
+    
+    // Fallback to old format
     const sourceSections = text.split('---').filter(section => 
       section.includes('**URL:**') && section.trim().length > 50
     );
@@ -448,31 +639,95 @@ class Retriever {
   }
 
   private assessDomainAuthority(domain: string): 'High' | 'Medium' | 'Low' {
-    const highAuthority = [
-      'sec.gov', 'treasury.gov', 'federalreserve.gov',
-      'bloomberg.com', 'reuters.com', 'wsj.com', 'ft.com',
-      'marketwatch.com', 'morningstar.com', 'yahoo.com',
-      'stockanalysis.com', 'finviz.com'
-    ];
+    // Neutral authority assessment based only on domain type, not editorial bias
     
-    const mediumAuthority = [
-      'cnbc.com', 'cnn.com', 'forbes.com', 'investopedia.com',
-      'seeking.alpha.com', 'fool.com'
-    ];
+    // Government and educational domains are generally authoritative
+    if (domain.includes('.gov') || domain.includes('.edu') || domain.includes('.org')) {
+      return 'High';
+    }
     
-    if (highAuthority.some(auth => domain.includes(auth))) return 'High';
-    if (mediumAuthority.some(auth => domain.includes(auth))) return 'Medium';
+    // Established domains with HTTPS and no obvious spam indicators
+    if (domain.length > 4 && 
+        !domain.includes('blogspot') && 
+        !domain.includes('wordpress') &&
+        !domain.includes('blog') &&
+        !domain.includes('forum')) {
+      return 'Medium';
+    }
+    
+    // Everything else gets low authority
     return 'Low';
   }
 
   private assessTitleRelevance(title: string): number {
-    // Simple relevance based on financial keywords
-    const financialKeywords = ['stock', 'price', 'quote', 'market', 'earnings', 'dividend', 'analysis'];
-    const matches = financialKeywords.filter(keyword => 
-      title.toLowerCase().includes(keyword)
-    ).length;
+    // Neutral relevance - just check if title has meaningful content
+    if (title.length < 5) return 0.1;
+    if (title.length < 20) return 0.3;
+    if (title.length < 50) return 0.5;
+    return 0.7; // Longer titles assumed to have more content
+  }
+
+  private extractEnhancedSourceData(section: string): SourceAnalysis | null {
+    const urlMatch = section.match(/URL:\s*(.+)/);
+    const applicableMatch = section.match(/APPLICABLE:\s*(Yes|No)/i);
+    const relevanceMatch = section.match(/RELEVANCE:\s*(High|Medium|Low)/i);
+    const recencyMatch = section.match(/RECENCY:\s*(.+)/);
+    const reliabilityMatch = section.match(/RELIABILITY:\s*(.+)/);
     
-    return Math.min(0.3 + (matches * 0.2), 1.0); // 0.3 base + 0.2 per keyword, max 1.0
+    if (!urlMatch) return null;
+    
+    const url = urlMatch[1].trim();
+    const domain = this.extractDomain(url);
+    const isApplicable = applicableMatch ? applicableMatch[1].toLowerCase() === 'yes' : true;
+    const relevanceLevel = relevanceMatch ? relevanceMatch[1] : 'Medium';
+    const recency = recencyMatch ? recencyMatch[1].trim() : undefined;
+    const reliability = reliabilityMatch ? reliabilityMatch[1].trim() : 'Not specified';
+    
+    // Convert relevance to score
+    const relevanceScore = this.convertRelevanceToScore(relevanceLevel, isApplicable);
+    
+    // Convert relevance level to authority (for now, we'll use relevance as proxy)
+    const authority = this.convertRelevanceToAuthority(relevanceLevel);
+    
+    // Extract key facts
+    const keyFacts: string[] = [];
+    const factsSection = section.match(/KEY_FACTS:\s*(.+?)(?:\n\*\*|$)/s);
+    if (factsSection) {
+      const facts = factsSection[1].trim();
+      if (facts && facts !== '[Specific facts that answer the query]') {
+        keyFacts.push(facts);
+      }
+    }
+    
+    return {
+      url,
+      domain,
+      relevanceScore,
+      authority,
+      publicationDate: recency && recency !== 'How current is this information?' ? recency : undefined,
+      keyFacts,
+      contentQuality: `Enhanced analysis: ${reliability}`
+    };
+  }
+
+  private convertRelevanceToScore(relevance: string, applicable: boolean): number {
+    if (!applicable) return 0.1; // Very low if not applicable
+    
+    switch (relevance.toLowerCase()) {
+      case 'high': return 0.9;
+      case 'medium': return 0.6;
+      case 'low': return 0.3;
+      default: return 0.5;
+    }
+  }
+
+  private convertRelevanceToAuthority(relevance: string): 'High' | 'Medium' | 'Low' {
+    switch (relevance.toLowerCase()) {
+      case 'high': return 'High';
+      case 'medium': return 'Medium';
+      case 'low': return 'Low';
+      default: return 'Medium';
+    }
   }
 
   private extractSourceData(section: string): SourceAnalysis | null {
@@ -666,14 +921,17 @@ class Solver {
       try {
         const system = `You are the ${subtask.kind} specialist. Use the evidence graph and be concise but precise. Cite sources explicitly.`;
         
-        // Create enhanced prompt with explicit source tracking
+        // Create enhanced prompt with source-aware instructions
+        const hasRealSources = retrieval.sources.some(s => s !== 'internal-knowledge');
+        const verifyInstruction = hasRealSources ? 
+          'CRITICAL: Verify the previous step against the ORIGINAL research sources. Do not fabricate citations.' :
+          'CRITICAL: This is based on internal knowledge only. Do NOT fabricate external citations or research papers. Acknowledge the knowledge source limitations and only verify internal logical consistency.';
+        
         const promptData = {
           subtask,
           context,
           evidence_graph: retrieval,
-          instruction: subtask.kind === 'verify' ? 
-            'CRITICAL: Verify the previous step against the ORIGINAL research sources. Do not use internal knowledge if real sources were found.' :
-            'Use the provided evidence and sources to complete this task.'
+          instruction: subtask.kind === 'verify' ? verifyInstruction : 'Use the provided evidence and sources to complete this task.'
         };
         
         const generateOptions: any = {
@@ -992,11 +1250,13 @@ function printUsage() {
   console.log('Usage: npx tsx multi-agent-reasoning.ts [OPTIONS] "<your goal here>"\n');
   console.log('Options:');
   console.log('  -m, --model PROVIDER    Choose AI provider: openai (default) or groq');
+  console.log('  -s, --search MODE       Search behavior: always, never, or auto (default)');
   console.log('  -h, --help              Show this help message\n');
   console.log('Examples:');
   console.log('  npx tsx multi-agent-reasoning.ts "Explain quantum computing basics"');
   console.log('  npx tsx multi-agent-reasoning.ts -m groq "How does blockchain work?"');
-  console.log('  npx tsx multi-agent-reasoning.ts --model openai "Optimize React performance"\n');
+  console.log('  npx tsx multi-agent-reasoning.ts -s always "Latest AI developments"');
+  console.log('  npx tsx multi-agent-reasoning.ts -s never "Basic math concepts"\n');
   console.log('Environment Variables:');
   console.log('  OPENAI_API_KEY - Required for OpenAI provider');
   console.log('  GROQ_API_KEY   - Required for Groq provider\n');
@@ -1014,7 +1274,7 @@ function printUsage() {
   console.log('  🧠 No search: Math, code, concepts, definitions, how-to\n');
 }
 
-export async function runMultiAgentReasoning(goal: string, provider: ModelProvider = 'openai') {
+export async function runMultiAgentReasoning(goal: string, provider: ModelProvider = 'openai', searchMode: 'always' | 'never' | 'auto' = 'auto') {
   if (!validateEnvironment(provider)) {
     process.exit(1);
   }
@@ -1023,9 +1283,20 @@ export async function runMultiAgentReasoning(goal: string, provider: ModelProvid
   MODELS = createModels(provider);
   console.log(`\n🤖 Using ${MODELS.provider}: ${MODELS.models}`);
 
-  // Enable real web search for Groq models
-  const useRealSearch = provider === 'groq';
-  const retriever = new Retriever(useRealSearch);
+  // Determine search behavior based on flags
+  let useRealSearch = false;
+  if (searchMode === 'always') {
+    useRealSearch = provider === 'groq'; // Only Groq has web search
+    console.log('  🔍 Search mode: ALWAYS (forced web search when possible)');
+  } else if (searchMode === 'never') {
+    useRealSearch = false;
+    console.log('  🧠 Search mode: NEVER (internal knowledge only)');
+  } else {
+    useRealSearch = provider === 'groq';
+    console.log('  🎯 Search mode: AUTO (smart detection)');
+  }
+  
+  const retriever = new Retriever(useRealSearch, searchMode);
   const tooling = new Tooling();
   const planner = new Planner();
   const solver = new Solver(retriever);
@@ -1089,6 +1360,7 @@ function parseArgs(args: string[]) {
     provider: 'openai' as ModelProvider,
     goal: '',
     help: false,
+    search: 'auto' as 'always' | 'never' | 'auto',
   };
   
   for (let i = 0; i < args.length; i++) {
@@ -1107,6 +1379,17 @@ function parseArgs(args: string[]) {
           i++; // Skip next argument
         } else {
           console.error(`Error: Invalid provider '${nextArg}'. Use 'openai' or 'groq'.`);
+          process.exit(1);
+        }
+        break;
+      case '-s':
+      case '--search':
+        const searchArg = args[i + 1];
+        if (searchArg === 'always' || searchArg === 'never' || searchArg === 'auto') {
+          result.search = searchArg;
+          i++; // Skip next argument
+        } else {
+          console.error(`Error: Invalid search mode '${searchArg}'. Use 'always', 'never', or 'auto'.`);
           process.exit(1);
         }
         break;
@@ -1130,7 +1413,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     process.exit(args.help ? 0 : 1);
   }
   
-  runMultiAgentReasoning(args.goal, args.provider).catch(err => {
+  runMultiAgentReasoning(args.goal, args.provider, args.search).catch(err => {
     logError(`Execution failed: ${err.message}`);
     console.error(err);
     process.exit(1);
